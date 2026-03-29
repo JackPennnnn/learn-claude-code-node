@@ -5,7 +5,7 @@ import { stdin as input, stdout as output } from 'node:process';
 import { tools, executeTool } from './tools/index.js';
 
 const openai = new OpenAI({
-    apiKey: 'sk-614b0cc27f774cf1b7a7815329280d76',
+    apiKey: '',
     baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 });
 
@@ -48,17 +48,17 @@ Prefer using tools over writing prose.`
                 });
 
                 const assistantOutput = response.choices[0].message;
-                
+
                 // 某些模型在 tool_calls 时 content 为 null，需要处理
                 if (assistantOutput.content === null) assistantOutput.content = "";
-                
+
                 // 【核心修改 3】必须把大模型的回复（包括它想调用工具的意图）存入历史
                 messages.push(assistantOutput);
 
                 if (!assistantOutput.tool_calls) {
                     // 模型给出了最终回答，不再需要工具
                     console.log(`🤖: ${assistantOutput.content}`);
-                    isThinking = false; 
+                    isThinking = false;
                 } else {
                     // 模型想要调用工具
                     // 【s03 新增】跟踪本轮是否调用了 todo 工具
@@ -67,7 +67,7 @@ Prefer using tools over writing prose.`
                     for (const toolCall of assistantOutput.tool_calls) {
                         const toolName = toolCall.function.name;
                         const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
-                        
+
                         console.log(`🛠️ 执行工具: ${toolName}...`);
                         const result = await executeTool(toolName, toolArgs);
                         // 把工具执行的结果打印出来，这样你能在控制台看到 todo 的渲染清单
@@ -79,7 +79,7 @@ Prefer using tools over writing prose.`
                             role: "tool",
                             tool_call_id: toolCall.id,
                             name: toolName,
-                            content: String(result) 
+                            content: String(result)
                         });
 
                         // 【s03】检测是否调用了 todo 工具
