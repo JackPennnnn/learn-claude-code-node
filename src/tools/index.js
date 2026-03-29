@@ -1,6 +1,21 @@
 import { writeFile, readFile } from './fs.js';
 import { executeBash } from './bash.js';
 import { todoManager } from './todo.js';
+// 【s05 新增】导入技能加载器
+import { SkillLoader } from './skill-loader.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// ═══════════════════════════════════════════════════════════════════════
+// 【s05 新增】初始化技能加载器
+//
+// __dirname 在 ESM 模块中不可用，需要手动计算
+// 技能目录位于项目根目录下的 skills/ 文件夹
+// ═══════════════════════════════════════════════════════════════════════
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '../../');
+export const skillLoader = new SkillLoader(path.join(PROJECT_ROOT, 'skills'));
 
 // ═══════════════════════════════════════════════════════════════════════
 // 【s04 核心改动】工具分层
@@ -94,6 +109,27 @@ export const childTools = [
                 required: ['items']
             }
         }
+    },
+    // 【s05 新增】load_skill 工具 —— 按需加载技能内容
+    // 为什么放在 childTools 而不是 parentTools？
+    //   因为加载技能只是读取文本，没有递归风险，
+    //   子 Agent 也应该能加载技能来获取领域知识。
+    {
+        type: 'function',
+        function: {
+            name: 'load_skill',
+            description: 'Load a skill by name to get detailed instructions. Use this when you need domain-specific guidance (e.g., git workflow, code review checklist). Check the system prompt for available skill names.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: {
+                        type: 'string',
+                        description: 'Name of the skill to load (e.g., "git", "code-review")'
+                    }
+                },
+                required: ['name']
+            }
+        }
     }
 ];
 
@@ -156,6 +192,12 @@ export const executeTool = async (toolName, toolArgs) => {
         // s03: todo tool execution
         case 'todo':
             return todoManager.update(toolArgs.items);
+
+        // 【s05 新增】load_skill 工具 —— 按需加载技能完整内容
+        // 这是"第二层"加载：模型在 system prompt 中看到技能名称后，
+        // 决定需要某个技能时，调用此工具获取完整指令
+        case 'load_skill':
+            return skillLoader.getContent(toolArgs.name);
 
         // 【s04 新增】task 工具 —— 启动子智能体
         // 为什么用动态 import() 而不是顶部 import？

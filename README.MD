@@ -15,6 +15,8 @@
 | s02 | 工具系统 | read_file / write_file / execute_bash | ✅ 已完成 |
 | s03 | TodoWrite | TodoManager + Nag Reminder | ✅ 已完成 |
 | s04 | 子 Agent | Sub Agent 上下文隔离 + 任务委派 | ✅ 已完成 |
+| s05 | 技能系统 | 按需加载 (Load on Demand) + UTF-8 中文规范 | ✅ 已完成 |
+| s04 | 子 Agent | Sub Agent 上下文隔离 + 任务委派 | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
@@ -106,6 +108,20 @@ claude-code-node/
 2. **上下文隔离** — 子 Agent 使用独立的 `messages=[]`，完成后整个历史被丢弃
 3. **只返回摘要** — 子 Agent 可能跑了 30+ 轮工具调用，但父 Agent 只收到一段简洁的文本摘要
 4. **安全限制** — 子 Agent 最多运行 30 轮，防止无限循环
+
+### 技能系统 (s05)
+
+解决 System Prompt 臃肿问题——“用到什么知识，临时加载什么知识”。
+
+```
+第一层：System Prompt (低成本)
+列出技能名称和描述。
+
+第二层：load_skill 工具 (按需加载)
+模型调用工具，在 tool_result 中注入完整的详细指令。
+```
+
+**UTF-8 规范**：本项目所有技能均要求生成 **中文** Commit 信息，并强制使用 **UTF-8** 编码，确保在 GitHub 上不出现乱码。
 
 ## 🚀 快速开始
 

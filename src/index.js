@@ -6,7 +6,8 @@ import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 // 【s04 修改】引入 parentTools 替代原来的 tools
 // parentTools = childTools（基础工具） + task 工具（派发子任务）
-import { parentTools, executeTool } from './tools/index.js';
+// 【s05 新增】引入 skillLoader 获取技能描述列表
+import { parentTools, executeTool, skillLoader } from './tools/index.js';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -29,7 +30,10 @@ Only one task can be in_progress at a time.
 Prefer using tools over writing prose.
 Use the task tool to delegate subtasks that would benefit from a clean context.
 The task tool spawns a subagent that has its own fresh message history.
-Delegate work like reading multiple files, running commands, or any exploratory task.`
+Delegate work like reading multiple files, running commands, or any exploratory task.
+
+可用技能 (使用 load_skill 加载详细指令):
+${skillLoader.getDescriptions()}`
         }
     ];
 
