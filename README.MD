@@ -14,6 +14,7 @@
 | s01 | Agent 循环 | 多轮对话 + 工具调用循环 | ✅ 已完成 |
 | s02 | 工具系统 | read_file / write_file / execute_bash | ✅ 已完成 |
 | s03 | TodoWrite | TodoManager + Nag Reminder | ✅ 已完成 |
+| s04 | 子 Agent | Sub Agent 上下文隔离 + 任务委派 | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
@@ -22,11 +23,14 @@ claude-code-node/
 ├── src/
 │   ├── index.js              # Agent 主循环（对话 → 工具调用 → 回复）
 │   └── tools/
-│       ├── index.js           # 工具注册表 + dispatch（统一入口）
+│       ├── index.js           # 工具注册表 + 分层（childTools / parentTools）
 │       ├── fs.js              # 文件读写工具
 │       ├── bash.js            # Bash 命令执行工具
-│       └── todo.js            # s03: TodoManager（任务计划管理）
+│       ├── todo.js            # s03: TodoManager（任务计划管理）
+│       └── subagent.js        # s04: 子智能体（独立上下文执行子任务）
 ├── data/                      # 工具写入文件的默认目录
+├── .env                       # 环境变量（API Key，不上传到 GitHub）
+├── .gitignore
 ├── package.json
 └── README.MD
 ```
@@ -79,44 +83,111 @@ claude-code-node/
 2. **单 in_progress 约束** — 同一时间只能有一个任务处于进行中，强制顺序聚焦
 3. **Nag Reminder** — 连续 3 轮不调用 todo → 自动注入 `<reminder>` 提醒，制造问责压力
 
+### 子 Agent (s04)
+
+解决上下文污染问题——Agent 工作越久，`messages[]` 越胖，中间过程全留在上下文里浪费 token。
+
+```
+┌──────────────────┐       ┌──────────────────┐
+│   Parent Agent   │       │    Sub Agent     │
+│  messages=[...]  │       │  messages=[]     │ ← 全新的上下文
+│                  │       │                  │
+│  tool: task      │──────>│  Agent 循环      │
+│  prompt="..."    │       │   call tools     │
+│                  │       │   ...N 轮...     │
+│  result = "摘要"  │<──────│  return summary  │
+└──────────────────┘       └──────────────────┘
+  父上下文保持干净            子上下文用完即弃
+```
+
+**核心设计：**
+
+1. **工具分层** — `childTools`（基础工具）+ `parentTools`（基础 + task），子 Agent 没有 task 工具，防止无限递归
+2. **上下文隔离** — 子 Agent 使用独立的 `messages=[]`，完成后整个历史被丢弃
+3. **只返回摘要** — 子 Agent 可能跑了 30+ 轮工具调用，但父 Agent 只收到一段简洁的文本摘要
+4. **安全限制** — 子 Agent 最多运行 30 轮，防止无限循环
+
 ## 🚀 快速开始
 
-### 安装依赖
+### 1. 克隆项目
+
+```bash
+git clone https://github.com/你的用户名/claude-code-node.git
+cd claude-code-node
+```
+
+### 2. 安装依赖
 
 ```bash
 pnpm install
 ```
 
-### 运行
+### 3. 配置环境变量
+
+复制 `.env.example` 创建 `.env` 文件，填入你的 API Key：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env` 文件：
+
+```env
+# 大模型 API 配置
+OPENAI_API_KEY=你的API密钥
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+> **⚠️ 注意**：`.env` 文件已加入 `.gitignore`，不会被上传到 GitHub，你的 API Key 是安全的。
+
+### 4. 运行项目
 
 ```bash
 node src/index.js
 ```
 
-### 试试这些 Prompt
-
-```
-1. Refactor the file hello.py: add type hints, docstrings, and a main guard
-2. Create a Python package with __init__.py, utils.py, and tests/test_utils.py
-3. Review all Python files and fix any style issues
-```
-
 输入 `exit` 退出程序。
 
-## ⚙️ 配置
+### 5. 试试这些 Prompt
 
-项目使用阿里云 DashScope 兼容 API：
-
-```javascript
-const openai = new OpenAI({
-    apiKey: 'your-api-key',
-    baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-});
+**基础工具测试：**
+```
+帮我创建一个 hello.js 文件，内容是 console.log('Hello World')
 ```
 
-模型：`qwen3.5-flash`
+**TodoWrite 测试（s03）：**
+```
+Create a Python package with __init__.py, utils.py, and tests/test_utils.py
+```
 
-如需更换模型或 API 服务商，修改 `src/index.js` 中的配置即可。
+**子 Agent 测试（s04）：**
+```
+Use a subtask to find what files are in this project
+Delegate: read all .js files and summarize what each one does
+Use a task to create a new module, then verify it from here
+```
+
+## ⚙️ 配置说明
+
+### API 配置
+
+项目通过 `.env` 文件管理 API 配置（使用 [dotenv](https://www.npmjs.com/package/dotenv) 加载）：
+
+| 环境变量 | 说明 | 示例 |
+|---------|------|------|
+| `OPENAI_API_KEY` | 大模型 API 密钥 | `sk-xxx` |
+| `OPENAI_BASE_URL` | API 端点地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+
+当前使用的模型：`qwen3.5-flash`
+
+如需更换模型，修改 `src/index.js` 和 `src/tools/subagent.js` 中的 `model` 字段。
+
+### 依赖说明
+
+| 依赖 | 用途 |
+|------|------|
+| `openai` | OpenAI 兼容 API 客户端 |
+| `dotenv` | 从 `.env` 文件加载环境变量 |
 
 ## 📚 学习路线
 
@@ -124,8 +195,8 @@ const openai = new OpenAI({
 
 - **s01** Agent 循环 — 理解 LLM 如何在循环中持续思考
 - **s02** 工具系统 — 给 Agent 装上"手和脚"
-- **s03** TodoWrite — 让 Agent 先计划再动手（本阶段）
-- **s04** 子 Agent — 任务分解与委托
+- **s03** TodoWrite — 让 Agent 先计划再动手
+- **s04** 子 Agent — 任务委派与上下文隔离（✅ 当前阶段）
 - **s05** 技能系统 — 可复用的能力模块
 - **s06** 上下文压缩 — 解决上下文窗口溢出
 - ...

@@ -1,12 +1,16 @@
 import OpenAI from "openai";
+// 从 .env 文件中加载环境变量（API Key 等敏感信息不硬编码在代码里）
+import 'dotenv/config';
 import process from 'process';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { tools, executeTool } from './tools/index.js';
+// 【s04 修改】引入 parentTools 替代原来的 tools
+// parentTools = childTools（基础工具） + task 工具（派发子任务）
+import { parentTools, executeTool } from './tools/index.js';
 
 const openai = new OpenAI({
-    apiKey: '',
-    baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.OPENAI_BASE_URL
 });
 
 const rl = readline.createInterface({ input, output });
@@ -14,7 +18,7 @@ const rl = readline.createInterface({ input, output });
 async function main() {
     // 【核心修改 1】messages 放在循环外，作为整个会话的历史记录
     // 【s03 修改】系统提示中告诉模型使用 todo 工具来规划多步任务
-    // 这条指令让模型在拿到复杂任务时不会直接动手，而是先列出计划
+    // 【s04 修改】系统提示中增加 task 工具的使用说明
     const messages = [
         {
             role: 'system',
@@ -22,7 +26,10 @@ async function main() {
 Use the todo tool to plan multi-step tasks.
 Mark tasks as in_progress before starting, and completed when done.
 Only one task can be in_progress at a time.
-Prefer using tools over writing prose.`
+Prefer using tools over writing prose.
+Use the task tool to delegate subtasks that would benefit from a clean context.
+The task tool spawns a subagent that has its own fresh message history.
+Delegate work like reading multiple files, running commands, or any exploratory task.`
         }
     ];
 
@@ -44,7 +51,9 @@ Prefer using tools over writing prose.`
                     model: 'qwen3.5-flash',
                     messages: messages, // 发送完整的历史记录
                     enable_thinking: true,
-                    tools
+                    // 【s04 修改】使用 parentTools 替代原来的 tools
+                    // parentTools 包含所有基础工具 + task 工具
+                    tools: parentTools
                 });
 
                 const assistantOutput = response.choices[0].message;
