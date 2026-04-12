@@ -3,6 +3,7 @@ import { executeBash } from './bash.js';
 import { todoManager } from './todo.js';
 // 【s05 新增】导入技能加载器
 import { SkillLoader } from './skill-loader.js';
+import { requestManualCompact } from '../context/compact.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -145,6 +146,21 @@ export const childTools = [
  */
 export const parentTools = [
     ...childTools,
+    // 【s06 新增】compact 工具 —— 手动触发完整压缩
+    // 这个工具本身不直接生成摘要，只是发出“下一轮必须压缩”的信号。
+    // 真正执行仍复用 maybeCompactMessages() / compactHistory()，
+    // 这样自动压缩和手动压缩始终共用同一条实现路径。
+    {
+        type: 'function',
+        function: {
+            name: 'compact',
+            description: 'Compact the current conversation history for continuity. Use this when the context feels crowded or when you want to proactively summarize progress.',
+            parameters: {
+                type: 'object',
+                properties: {}
+            }
+        }
+    },
     // 【s04 新增】task 工具 —— 分派子任务
     {
         type: 'function',
@@ -198,6 +214,10 @@ export const executeTool = async (toolName, toolArgs) => {
         // 决定需要某个技能时，调用此工具获取完整指令
         case 'load_skill':
             return skillLoader.getContent(toolArgs.name);
+
+        case 'compact':
+            requestManualCompact();
+            return '已请求执行上下文压缩。下一轮思考前会复用统一的 compact 逻辑生成连续性摘要。';
 
         // 【s04 新增】task 工具 —— 启动子智能体
         // 为什么用动态 import() 而不是顶部 import？

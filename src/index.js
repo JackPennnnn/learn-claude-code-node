@@ -8,11 +8,19 @@ import { stdin as input, stdout as output } from 'node:process';
 // parentTools = childTools（基础工具） + task 工具（派发子任务）
 // 【s05 新增】引入 skillLoader 获取技能描述列表
 import { parentTools, executeTool, skillLoader } from './tools/index.js';
+import {
+    createCompactState,
+    maybeCompactMessages,
+    persistLargeOutput,
+    consumeManualCompactRequest,
+    noteToolUsage
+} from './context/compact.js';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
     baseURL: process.env.OPENAI_BASE_URL
 });
+const MODEL = 'qwen3.5-flash';
 
 const rl = readline.createInterface({ input, output });
 
@@ -20,7 +28,7 @@ async function main() {
     // 【核心修改 1】messages 放在循环外，作为整个会话的历史记录
     // 【s03 修改】系统提示中告诉模型使用 todo 工具来规划多步任务
     // 【s04 修改】系统提示中增加 task 工具的使用说明
-    const messages = [
+    let messages = [
         {
             role: 'system',
             content: `你是一个专业的编程助手，可以使用工具来完成任务。
@@ -36,6 +44,7 @@ Delegate work like reading multiple files, running commands, or any exploratory 
 ${skillLoader.getDescriptions()}`
         }
     ];
+    const compactState = createCompactState();
 
     // 【s03 新增】跟踪模型连续多少轮没有调用 todo 工具
     // 这个计数器是 nag reminder 机制的基础
@@ -51,8 +60,22 @@ ${skillLoader.getDescriptions()}`
 
             let isThinking = true;
             while (isThinking) {
+                // 【s06 新增】在每次调用模型前统一做上下文预算管理
+                // 这里会依次执行：
+                //   1. 微压缩旧工具结果
+                //   2. 估算当前上下文大小
+                //   3. 如有必要，生成连续性摘要
+                // 手动 compact 和自动超阈值压缩都走同一入口，避免两套逻辑分叉。
+                messages = await maybeCompactMessages({
+                    messages,
+                    compactState,
+                    openai,
+                    model: MODEL,
+                    force: consumeManualCompactRequest()
+                });
+
                 const response = await openai.chat.completions.create({
-                    model: 'qwen3.5-flash',
+                    model: MODEL,
                     messages: messages, // 发送完整的历史记录
                     enable_thinking: true,
                     // 【s04 修改】使用 parentTools 替代原来的 tools
@@ -80,11 +103,16 @@ ${skillLoader.getDescriptions()}`
                     for (const toolCall of assistantOutput.tool_calls) {
                         const toolName = toolCall.function.name;
                         const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+                        noteToolUsage(compactState, toolName, toolArgs);
 
                         console.log(`🛠️ 执行工具: ${toolName}...`);
                         const result = await executeTool(toolName, toolArgs);
                         // 把工具执行的结果打印出来，这样你能在控制台看到 todo 的渲染清单
                         console.log(`   ↪ ${String(result).substring(0, 500)}`);
+
+                        // 【s06 新增】大工具结果不再直接整段塞进 messages
+                        // 如果内容太大，会先完整落盘，然后只把结构化预览放回上下文。
+                        const compactedToolResult = await persistLargeOutput(toolName, toolCall.id, result);
 
                         // 【核心修改 4】极其重要！必须把工具执行的结果追加到 messages
                         // 这样下一轮循环时，模型才能看到结果并给出最终回复
@@ -92,7 +120,7 @@ ${skillLoader.getDescriptions()}`
                             role: "tool",
                             tool_call_id: toolCall.id,
                             name: toolName,
-                            content: String(result)
+                            content: compactedToolResult
                         });
 
                         // 【s03】检测是否调用了 todo 工具

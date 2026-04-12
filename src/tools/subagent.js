@@ -30,6 +30,7 @@
 import OpenAI from 'openai';
 import 'dotenv/config';
 import { childTools, executeTool } from './index.js';
+import { persistLargeOutput } from '../context/compact.js';
 
 // 复用同一个 OpenAI 客户端配置
 // 注意：这里和主 index.js 用的是同一套 API 配置
@@ -39,6 +40,7 @@ const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
     baseURL: process.env.OPENAI_BASE_URL
 });
+const MODEL = 'qwen3.5-flash';
 
 /**
  * 子智能体的系统提示
@@ -99,7 +101,7 @@ export async function runSubAgent(prompt) {
         // 调用大模型，注意这里用的是 childTools 而不是 parentTools
         // 这意味着子 Agent 不能再调用 task 工具，防止无限递归
         const response = await openai.chat.completions.create({
-            model: 'qwen3.5-flash',
+            model: MODEL,
             messages: subMessages,
             tools: childTools.length > 0 ? childTools : undefined,
             enable_thinking: true,
@@ -138,17 +140,17 @@ export async function runSubAgent(prompt) {
                 result = `工具执行出错: ${err.message}`;
             }
 
-            // 截断过长的工具输出（最多 50000 字符）
-            // 防止单次工具调用返回巨量文本撑爆上下文
-            const truncatedResult = String(result).substring(0, 50000);
-            console.log(`      ↪ ${truncatedResult.substring(0, 200)}`);
+            // 【s06 新增】子 Agent 也复用“大输出先落盘，再放预览”的机制
+            // 这样即使子任务读到巨量内容，也不会因为单条 tool result 让子上下文失控。
+            const compactedResult = await persistLargeOutput(toolName, toolCall.id, result);
+            console.log(`      ↪ ${String(compactedResult).substring(0, 200)}`);
 
             // 把工具结果加入子 Agent 的消息历史
             subMessages.push({
                 role: 'tool',
                 tool_call_id: toolCall.id,
                 name: toolName,
-                content: truncatedResult
+                content: compactedResult
             });
         }
     }

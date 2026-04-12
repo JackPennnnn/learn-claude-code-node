@@ -16,7 +16,7 @@
 | s03 | TodoWrite | TodoManager + Nag Reminder | ✅ 已完成 |
 | s04 | 子 Agent | Sub Agent 上下文隔离 + 任务委派 | ✅ 已完成 |
 | s05 | 技能系统 | 按需加载 (Load on Demand) + UTF-8 中文规范 | ✅ 已完成 |
-| s04 | 子 Agent | Sub Agent 上下文隔离 + 任务委派 | ✅ 已完成 |
+| s06 | 上下文压缩 | Persisted Output + Micro Compact + Summary Compact | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
@@ -123,6 +123,28 @@ claude-code-node/
 
 **UTF-8 规范**：本项目所有技能均要求生成 **中文** Commit 信息，并强制使用 **UTF-8** 编码，确保在 GitHub 上不出现乱码。
 
+### 上下文压缩 (s06)
+
+解决长会话里的“上下文膨胀”问题。目标不是删除历史，而是在更短的活跃上下文里保住连续性。
+
+```
+第 1 层：大结果不直接塞进上下文
+  -> 保存到 data/context-outputs/，只保留预览
+
+第 2 层：旧工具结果不一直原样保留
+  -> 只保留最近 3 个 tool result 的完整内容
+
+第 3 层：整体历史过长时
+  -> 生成连续性摘要，再配合最近几轮消息继续工作
+```
+
+**当前实现包含：**
+
+1. **Persisted Output** — 工具返回内容超过阈值时，全文写入 `data/context-outputs/`，`messages` 中只留 `<persisted-output>` 标记和预览。
+2. **Micro Compact** — 更早的 tool result 会被替换成占位文本，防止旧结果长期霸占窗口。
+3. **Summary Compact** — 当 `messages` 继续膨胀时，会自动生成一份包含“目标 / 已完成 / 文件 / 约束 / 下一步”的连续性摘要。
+4. **手动 compact** — 模型也可以主动调用 `compact` 工具，和自动压缩复用同一条逻辑。
+
 ## 🚀 快速开始
 
 ### 1. 克隆项目
@@ -181,6 +203,12 @@ Create a Python package with __init__.py, utils.py, and tests/test_utils.py
 Use a subtask to find what files are in this project
 Delegate: read all .js files and summarize what each one does
 Use a task to create a new module, then verify it from here
+```
+
+**上下文压缩测试（s06）：**
+```
+先运行一条会产生很长输出的 bash 命令，再继续总结结果
+如果你觉得上下文已经很乱，请主动调用 compact 工具
 ```
 
 ## ⚙️ 配置说明
