@@ -20,6 +20,11 @@ import { rl } from './io/rl.js';
 //   gatekeep      —— 工具执行前的门禁
 //   getMode/setMode/describeState —— 支撑 /mode、/perm 斜杠命令
 import { gatekeep, getMode, setMode, describeState } from './permissions/index.js';
+// 【s08 新增】Hook 系统入口
+//   runHooks(eventName, payload) —— 在固定时机派发扩展行为
+//   主循环只暴露 3 个时机：SessionStart / PreToolUse / PostToolUse
+//   import 时会自动注册内置示范 handler（欢迎信息 + 审计日志）
+import { runHooks } from './hooks/index.js';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -48,6 +53,11 @@ ${skillLoader.getDescriptions()}`
         }
     ];
     const compactState = createCompactState();
+
+    // 【s08 新增】会话起手就触发一次 SessionStart hook
+    // 内置 handler 会打印欢迎信息 + 当前权限模式
+    // 用户可以通过 register('SessionStart', ...) 追加自己的开场行为
+    await runHooks('SessionStart', { mode: getMode() });
 
     // 【s03 新增】跟踪模型连续多少轮没有调用 todo 工具
     // 这个计数器是 nag reminder 机制的基础
@@ -143,10 +153,51 @@ ${skillLoader.getDescriptions()}`
                             toolResultText = `Permission denied: ${decision.reason}`;
                             console.log(`   ⛔ ${toolResultText}`);
                         } else {
-                            console.log(`🛠️ 执行工具: ${toolName}...`);
-                            toolResultText = await executeTool(toolName, toolArgs);
-                            // 把工具执行的结果打印出来，这样你能在控制台看到 todo 的渲染清单
-                            console.log(`   ↪ ${String(toolResultText).substring(0, 500)}`);
+                            // 【s08 关键改动】权限放行后，再过一道 PreToolUse hook
+                            //   设计取舍：gatekeep 是"硬规则"，hook 是"侧车扩展"
+                            //   被 deny 的调用根本不会触发 hook，避免双层语义打架
+                            //
+                            //   退出码语义（教学版统一约定）：
+                            //     0 → 正常继续
+                            //     1 → 阻止执行；把 message 作为 tool_result 写回
+                            //     2 → 注入一条 user 消息后继续执行
+                            const pre = await runHooks('PreToolUse', {
+                                tool_name: toolName,
+                                input: toolArgs
+                            });
+
+                            if (pre.exit_code === 1) {
+                                toolResultText = `Hook blocked: ${pre.message || '(no reason)'}`;
+                                console.log(`   🪝 ${toolResultText}`);
+                            } else {
+                                if (pre.exit_code === 2 && pre.message) {
+                                    // 把 hook 的补充说明作为 user 消息插入，让模型看到
+                                    // 用 <hook> 标签包裹，区别于真正的用户输入
+                                    messages.push({
+                                        role: 'user',
+                                        content: `<hook>${pre.message}</hook>`
+                                    });
+                                    console.log(`   🪝 PreToolUse 注入提示: ${pre.message}`);
+                                }
+
+                                console.log(`🛠️ 执行工具: ${toolName}...`);
+                                toolResultText = await executeTool(toolName, toolArgs);
+                                console.log(`   ↪ ${String(toolResultText).substring(0, 500)}`);
+
+                                // 【s08】工具执行完毕后触发 PostToolUse hook
+                                //   - 内置 handler 会写一行审计日志
+                                //   - 如果 handler 返回 exit_code=2，把补充说明追加到 tool_result 末尾
+                                //   - 不会把 PostToolUse 的副作用直接塞回 messages，保持"观察用"语义
+                                const post = await runHooks('PostToolUse', {
+                                    tool_name: toolName,
+                                    input: toolArgs,
+                                    output: toolResultText
+                                });
+                                if (post.exit_code === 2 && post.message) {
+                                    toolResultText = `${toolResultText}\n\n[hook] ${post.message}`;
+                                    console.log(`   🪝 PostToolUse 追加说明: ${post.message}`);
+                                }
+                            }
                         }
 
                         // 【s06 新增】大工具结果不再直接整段塞进 messages

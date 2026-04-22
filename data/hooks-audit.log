@@ -1,0 +1,2 @@
+2026-04-22T09:13:42.421Z | write_file | {"path":"hello.ts","content":"console.log(\"Hello, World!\");"} | out=25
+2026-04-22T09:14:07.806Z | write_file | {"path":"data/hello.ts","content":"console.log(\"hello wor123\");"} | out=25

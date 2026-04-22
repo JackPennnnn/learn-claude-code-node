@@ -18,6 +18,7 @@
 | s05 | 技能系统 | 按需加载 (Load on Demand) + UTF-8 中文规范 | ✅ 已完成 |
 | s06 | 上下文压缩 | Persisted Output + Micro Compact + Summary Compact | ✅ 已完成 |
 | s07 | 权限系统 | deny/mode/bash-safety/allow/ask 五段管道 + 三种模式 | ✅ 已完成 |
+| s08 | Hook 系统 | SessionStart / PreToolUse / PostToolUse + 统一 0/1/2 退出码 | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
@@ -30,6 +31,8 @@ claude-code-node/
 │   ├── permissions/           # s07: 权限系统
 │   │   ├── index.js           #   核心管道：checkPermission / gatekeep / setMode 等
 │   │   └── bash-safety.js     #   bash 最小安全检查（sudo / rm -rf / 命令替换…）
+│   ├── hooks/                 # s08: Hook 系统
+│   │   └── index.js           #   HookRunner + register/runHooks，内置欢迎 + 审计示范
 │   ├── context/
 │   │   └── compact.js         # s06: 上下文压缩
 │   └── tools/
@@ -226,6 +229,96 @@ LLM 决定调用工具
 3. **连续被拒计数。** 累计 ≥3 次会在控制台打印提示，建议你切到 `plan` 模式或重新明确目标。
 4. **deny 一定先于 allow / mode。** 这样像 `sudo` 这种命令在任何模式下都不会被放过。
 
+### Hook 系统 (s08)
+
+s07 解决了"准不准动手"，但还有一类需求不属于"允许/拒绝"这条线：
+
+- 会话开始时打印欢迎信息
+- 工具执行前后顺手做点事（统计、提醒、补一条说明）
+- 让用户/插件在系统边缘扩展能力，但不必修改主循环
+
+**核心理念（一句话）：主循环只负责暴露"时机"，真正的附加行为交给 hook。**
+
+```
+LLM 决定调用工具
+       │
+       ▼
+┌─────────────────────────┐
+│  s07: gatekeep          │ ── deny ──► 塞 Permission denied 进 tool_result
+└──────────┬──────────────┘
+           │ allow
+           ▼
+┌─────────────────────────┐
+│  s08: PreToolUse hook   │ ── exit 1 ─► 塞 Hook blocked 进 tool_result
+└──────────┬──────────────┘ ── exit 2 ─► 把 message 作为 user 消息插入，再继续
+           │ exit 0
+           ▼
+       executeTool
+           │
+           ▼
+┌─────────────────────────┐
+│  s08: PostToolUse hook  │ ── exit 2 ─► 把 message 追加到 tool_result 末尾
+└──────────┬──────────────┘ ── exit 0 ─► 不动 tool_result
+           │
+           ▼
+       塞回 messages
+```
+
+**三个事件 + 统一退出码：**
+
+| 事件 | 时机 | payload |
+|------|------|---------|
+| `SessionStart` | `main()` 起手处，进入用户输入循环之前 | `{ mode }` |
+| `PreToolUse` | 权限放行后、`executeTool` 之前 | `{ tool_name, input }` |
+| `PostToolUse` | `executeTool` 完成后 | `{ tool_name, input, output }` |
+
+| `exit_code` | 含义 |
+|-------------|------|
+| `0` | 正常继续 |
+| `1` | 阻止当前动作（PreToolUse 时不执行工具） |
+| `2` | 注入一条补充消息后继续 |
+
+**与 s07 权限系统的关系：**
+
+| 维度 | s07 gatekeep | s08 hook |
+|------|-------------|---------|
+| 定位 | 系统硬规则 | 侧车扩展 |
+| 决定的事 | 准不准执行 | 除了执行还要做什么 |
+| 顺序 | 先跑 | 后跑 |
+| 被 deny 时是否触发 | — | 不触发（避免双层语义打架） |
+| 父子 Agent | 共享同一套规则 | 共享同一个 HookRunner |
+
+**内置 handler（开箱即用）：**
+
+1. `SessionStart` → 启动时打印 `🪝 Hook 系统已就绪 | 当前权限模式: default`
+2. `PostToolUse` → 把每次工具调用一行追加到 `data/hooks-audit.log`，形如：
+   ```
+   2025-04-22T10:00:00.000Z | write_file | {"path":"x.txt"} | out=128
+   ```
+
+**注册自定义 Hook（最小示例）：**
+
+```js
+import { register } from './src/hooks/index.js';
+
+register('PreToolUse', async ({ tool_name, input }) => {
+  if (tool_name === 'write_file' && (input.content?.length ?? 0) > 50_000) {
+    return {
+      exit_code: 2,
+      message: '即将写入超过 50KB 的内容，请确认这是预期行为。'
+    };
+  }
+  return { exit_code: 0, message: '' };
+});
+```
+
+**几个容易踩坑的点：**
+
+1. **Hook 不是 gatekeep 的替代品。** 真正"准不准"的判断仍然交给 s07，hook 只在"已被允许"的工具上做扩展。
+2. **谁先返回 1/2 谁就赢。** 教学版没做合并策略，先注册的 handler 拥有优先权。
+3. **hook 抛错不会带崩主循环。** runner 把异常 catch 住，按 `exit_code=0` 继续，并打 warning。
+4. **`PostToolUse` 默认是观察用。** 不要靠它修改 messages —— 想注入说明请用 `exit_code=2` 显式声明。
+
 ## 🚀 快速开始
 
 ### 1. 克隆项目
@@ -306,6 +399,16 @@ Use a task to create a new module, then verify it from here
 /perm
 ```
 
+**Hook 系统测试（s08）：**
+```
+# 启动后第一行应该看到 🪝 Hook 系统已就绪
+node src/index.js
+
+# 让模型写一个文件，然后查看审计日志
+帮我创建 hello.txt，内容是 hi
+cat data/hooks-audit.log
+```
+
 ## ⚙️ 配置说明
 
 ### API 配置
@@ -338,7 +441,8 @@ Use a task to create a new module, then verify it from here
 - **s04** 子 Agent — 任务委派与上下文隔离
 - **s05** 技能系统 — 可复用的能力模块
 - **s06** 上下文压缩 — 解决上下文窗口溢出
-- **s07** 权限系统 — 在工具执行前过一道安全闸门（✅ 当前阶段）
+- **s07** 权限系统 — 在工具执行前过一道安全闸门
+- **s08** Hook 系统 — 在固定时机扩展系统，而不是改写主循环（✅ 当前阶段）
 - ...
 
 ## 📝 License

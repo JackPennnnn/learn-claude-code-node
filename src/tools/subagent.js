@@ -35,6 +35,11 @@ import { persistLargeOutput } from '../context/compact.js';
 // 这样设计的好处：父子两层 Agent 共享同一套规则、同一个连续被拒计数器，
 // 不会出现"父 Agent 被挡掉，子 Agent 偷偷绕过"的破窗
 import { gatekeep } from '../permissions/index.js';
+// 【s08 新增】子 Agent 也共享同一套 Hook
+// 父子 Agent 复用同一个 HookRunner，意味着任何注册的 PreToolUse / PostToolUse
+// 在子 Agent 内部一样会触发（比如审计日志会把子 Agent 的工具调用也记下来）
+// 注意：子 Agent 不触发 SessionStart —— 它不是新会话，只是父会话的一段子任务
+import { runHooks } from '../hooks/index.js';
 
 // 复用同一个 OpenAI 客户端配置
 // 注意：这里和主 index.js 用的是同一套 API 配置
@@ -144,13 +149,46 @@ export async function runSubAgent(prompt) {
                 result = `Permission denied: ${decision.reason}`;
                 console.log(`   ⛔ [Sub Agent] ${result}`);
             } else {
-                console.log(`   🛠️ [Sub Agent] 执行工具: ${toolName}...`);
-                try {
-                    result = await executeTool(toolName, toolArgs);
-                } catch (err) {
-                    // 工具执行出错时，把错误信息作为结果返回给子 Agent
-                    // 这样子 Agent 可以尝试修复或给出错误报告
-                    result = `工具执行出错: ${err.message}`;
+                // 【s08 新增】权限放行后再过一道 PreToolUse hook
+                // 与父 Agent 完全相同的语义：0=继续 / 1=阻止 / 2=注入提示后继续
+                const pre = await runHooks('PreToolUse', {
+                    tool_name: toolName,
+                    input: toolArgs
+                });
+
+                if (pre.exit_code === 1) {
+                    result = `Hook blocked: ${pre.message || '(no reason)'}`;
+                    console.log(`   🪝 [Sub Agent] ${result}`);
+                } else {
+                    if (pre.exit_code === 2 && pre.message) {
+                        // 子 Agent 的 hook 注入也走自己的 subMessages
+                        // 不会污染父 Agent 的上下文（这正是 s04 的初衷）
+                        subMessages.push({
+                            role: 'user',
+                            content: `<hook>${pre.message}</hook>`
+                        });
+                        console.log(`   🪝 [Sub Agent] PreToolUse 注入: ${pre.message}`);
+                    }
+
+                    console.log(`   🛠️ [Sub Agent] 执行工具: ${toolName}...`);
+                    try {
+                        result = await executeTool(toolName, toolArgs);
+                    } catch (err) {
+                        // 工具执行出错时，把错误信息作为结果返回给子 Agent
+                        // 这样子 Agent 可以尝试修复或给出错误报告
+                        result = `工具执行出错: ${err.message}`;
+                    }
+
+                    // 【s08】PostToolUse —— 子 Agent 的工具调用也会被审计 handler 记录
+                    const post = await runHooks('PostToolUse', {
+                        tool_name: toolName,
+                        input: toolArgs,
+                        output: result
+                    });
+                    if (post.exit_code === 2 && post.message) {
+                        result = `${result}\n\n[hook] ${post.message}`;
+                        console.log(`   🪝 [Sub Agent] PostToolUse 追加: ${post.message}`);
+                    }
                 }
             }
 
