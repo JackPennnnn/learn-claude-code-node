@@ -31,6 +31,10 @@ import OpenAI from 'openai';
 import 'dotenv/config';
 import { childTools, executeTool } from './index.js';
 import { persistLargeOutput } from '../context/compact.js';
+// 【s07 新增】子 Agent 同样要走权限管道
+// 这样设计的好处：父子两层 Agent 共享同一套规则、同一个连续被拒计数器，
+// 不会出现"父 Agent 被挡掉，子 Agent 偷偷绕过"的破窗
+import { gatekeep } from '../permissions/index.js';
 
 // 复用同一个 OpenAI 客户端配置
 // 注意：这里和主 index.js 用的是同一套 API 配置
@@ -130,14 +134,24 @@ export async function runSubAgent(prompt) {
             const toolName = toolCall.function.name;
             const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
 
-            console.log(`   🛠️ [Sub Agent] 执行工具: ${toolName}...`);
+            // 【s07 新增】子 Agent 也必须先过权限管道
+            //   - interactive: true 表示遇到 ask 时弹窗给用户（与父 Agent 行为一致）
+            //   - 被 deny 时不调 executeTool，把拒绝原因作为 tool result 返回，
+            //     让子 Agent 自己换方案，而不是死循环重试同一个被拒命令
+            const decision = await gatekeep(toolName, toolArgs, { interactive: true });
             let result;
-            try {
-                result = await executeTool(toolName, toolArgs);
-            } catch (err) {
-                // 工具执行出错时，把错误信息作为结果返回给子 Agent
-                // 这样子 Agent 可以尝试修复或给出错误报告
-                result = `工具执行出错: ${err.message}`;
+            if (decision.behavior === 'deny') {
+                result = `Permission denied: ${decision.reason}`;
+                console.log(`   ⛔ [Sub Agent] ${result}`);
+            } else {
+                console.log(`   🛠️ [Sub Agent] 执行工具: ${toolName}...`);
+                try {
+                    result = await executeTool(toolName, toolArgs);
+                } catch (err) {
+                    // 工具执行出错时，把错误信息作为结果返回给子 Agent
+                    // 这样子 Agent 可以尝试修复或给出错误报告
+                    result = `工具执行出错: ${err.message}`;
+                }
             }
 
             // 【s06 新增】子 Agent 也复用“大输出先落盘，再放预览”的机制

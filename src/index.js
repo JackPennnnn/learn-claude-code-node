@@ -2,8 +2,6 @@ import OpenAI from "openai";
 // 从 .env 文件中加载环境变量（API Key 等敏感信息不硬编码在代码里）
 import 'dotenv/config';
 import process from 'process';
-import * as readline from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
 // 【s04 修改】引入 parentTools 替代原来的 tools
 // parentTools = childTools（基础工具） + task 工具（派发子任务）
 // 【s05 新增】引入 skillLoader 获取技能描述列表
@@ -15,14 +13,19 @@ import {
     consumeManualCompactRequest,
     noteToolUsage
 } from './context/compact.js';
+// 【s07 新增】共享 readline 单例 —— 主循环和权限系统都从这里拿
+// 不再在主循环本地 createInterface，避免和权限弹窗抢 stdin
+import { rl } from './io/rl.js';
+// 【s07 新增】权限系统入口
+//   gatekeep      —— 工具执行前的门禁
+//   getMode/setMode/describeState —— 支撑 /mode、/perm 斜杠命令
+import { gatekeep, getMode, setMode, describeState } from './permissions/index.js';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
     baseURL: process.env.OPENAI_BASE_URL
 });
 const MODEL = 'qwen3.5-flash';
-
-const rl = readline.createInterface({ input, output });
 
 async function main() {
     // 【核心修改 1】messages 放在循环外，作为整个会话的历史记录
@@ -52,8 +55,33 @@ ${skillLoader.getDescriptions()}`
 
     while (true) {
         try {
-            const userInput = await rl.question('\n👤 你: ');
+            const userInput = await rl.question(`\n👤 你 [${getMode()}]: `);
             if (userInput.toLowerCase() === 'exit') break;
+
+            // 【s07 新增】斜杠命令 —— 不进入对话历史，仅本地处理
+            //   /mode <name>  切换权限模式（default / plan / auto）
+            //   /perm         打印当前权限状态
+            // 这两个命令是给"用户"用的，不是给模型用的，所以不会污染 messages
+            if (userInput.startsWith('/')) {
+                const [cmd, ...rest] = userInput.trim().split(/\s+/);
+                if (cmd === '/mode') {
+                    const target = rest[0];
+                    if (!target) {
+                        console.log(`当前模式: ${getMode()}（用法: /mode default|plan|auto）`);
+                    } else if (setMode(target)) {
+                        console.log(`✅ 已切换到 ${target} 模式`);
+                    } else {
+                        console.log(`❌ 未知模式: ${target}（可选: default / plan / auto）`);
+                    }
+                    continue;
+                }
+                if (cmd === '/perm') {
+                    console.log(describeState());
+                    continue;
+                }
+                console.log(`未知命令: ${cmd}（支持 /mode、/perm）`);
+                continue;
+            }
 
             // 【核心修改 2】将用户新输入的内容追加到历史中
             messages.push({ role: 'user', content: userInput });
@@ -105,14 +133,25 @@ ${skillLoader.getDescriptions()}`
                         const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
                         noteToolUsage(compactState, toolName, toolArgs);
 
-                        console.log(`🛠️ 执行工具: ${toolName}...`);
-                        const result = await executeTool(toolName, toolArgs);
-                        // 把工具执行的结果打印出来，这样你能在控制台看到 todo 的渲染清单
-                        console.log(`   ↪ ${String(result).substring(0, 500)}`);
+                        // 【s07 关键改动】工具执行前先过权限管道
+                        //   gatekeep 内部按顺序走：deny rules → mode → bash safety → allow rules → ask
+                        //   如果决策是 deny，跳过 executeTool，但仍然要塞一条 tool 消息回去——
+                        //   否则模型下一轮会因为 tool_call 缺少匹配的 tool_result 而报错。
+                        const decision = await gatekeep(toolName, toolArgs, { interactive: true });
+                        let toolResultText;
+                        if (decision.behavior === 'deny') {
+                            toolResultText = `Permission denied: ${decision.reason}`;
+                            console.log(`   ⛔ ${toolResultText}`);
+                        } else {
+                            console.log(`🛠️ 执行工具: ${toolName}...`);
+                            toolResultText = await executeTool(toolName, toolArgs);
+                            // 把工具执行的结果打印出来，这样你能在控制台看到 todo 的渲染清单
+                            console.log(`   ↪ ${String(toolResultText).substring(0, 500)}`);
+                        }
 
                         // 【s06 新增】大工具结果不再直接整段塞进 messages
                         // 如果内容太大，会先完整落盘，然后只把结构化预览放回上下文。
-                        const compactedToolResult = await persistLargeOutput(toolName, toolCall.id, result);
+                        const compactedToolResult = await persistLargeOutput(toolName, toolCall.id, toolResultText);
 
                         // 【核心修改 4】极其重要！必须把工具执行的结果追加到 messages
                         // 这样下一轮循环时，模型才能看到结果并给出最终回复
@@ -124,7 +163,8 @@ ${skillLoader.getDescriptions()}`
                         });
 
                         // 【s03】检测是否调用了 todo 工具
-                        if (toolName === 'todo') {
+                        // 注意：被 deny 的调用不算"成功更新过 todo"，所以放在分支判断里
+                        if (toolName === 'todo' && decision.behavior !== 'deny') {
                             usedTodo = true;
                         }
                     }

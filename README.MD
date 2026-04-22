@@ -17,19 +17,29 @@
 | s04 | 子 Agent | Sub Agent 上下文隔离 + 任务委派 | ✅ 已完成 |
 | s05 | 技能系统 | 按需加载 (Load on Demand) + UTF-8 中文规范 | ✅ 已完成 |
 | s06 | 上下文压缩 | Persisted Output + Micro Compact + Summary Compact | ✅ 已完成 |
+| s07 | 权限系统 | deny/mode/bash-safety/allow/ask 五段管道 + 三种模式 | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
 ```
 claude-code-node/
 ├── src/
-│   ├── index.js              # Agent 主循环（对话 → 工具调用 → 回复）
+│   ├── index.js              # Agent 主循环（对话 → 权限门禁 → 工具调用 → 回复）
+│   ├── io/
+│   │   └── rl.js              # s07: 共享 readline 单例（主循环和权限弹窗复用同一个 stdin）
+│   ├── permissions/           # s07: 权限系统
+│   │   ├── index.js           #   核心管道：checkPermission / gatekeep / setMode 等
+│   │   └── bash-safety.js     #   bash 最小安全检查（sudo / rm -rf / 命令替换…）
+│   ├── context/
+│   │   └── compact.js         # s06: 上下文压缩
 │   └── tools/
 │       ├── index.js           # 工具注册表 + 分层（childTools / parentTools）
 │       ├── fs.js              # 文件读写工具
 │       ├── bash.js            # Bash 命令执行工具
 │       ├── todo.js            # s03: TodoManager（任务计划管理）
+│       ├── skill-loader.js    # s05: 技能按需加载
 │       └── subagent.js        # s04: 子智能体（独立上下文执行子任务）
+├── skills/                    # s05: 技能定义目录
 ├── data/                      # 工具写入文件的默认目录
 ├── .env                       # 环境变量（API Key，不上传到 GitHub）
 ├── .gitignore
@@ -145,6 +155,77 @@ claude-code-node/
 3. **Summary Compact** — 当 `messages` 继续膨胀时，会自动生成一份包含“目标 / 已完成 / 文件 / 约束 / 下一步”的连续性摘要。
 4. **手动 compact** — 模型也可以主动调用 `compact` 工具，和自动压缩复用同一条逻辑。
 
+### 权限系统 (s07)
+
+到 s06 为止 Agent 已经能"动手"了，但模型的"意图"不应该直接变成"执行"——
+中间必须先过一道权限管道。s07 给项目加上的就是这条管道。
+
+**核心理念（一句话）：任何工具调用都不能直接落到 handler，必须先经过 `gatekeep()`。**
+
+```
+LLM 决定调用工具
+       │
+       ▼
+┌─────────────────────────┐
+│ 1. deny rules           │ ── 命中 ──┐
+├─────────────────────────┤           │
+│ 2. mode policy          │ ── 命中 ──┤
+│   plan → 阻所有写工具    │           │
+│   auto → 放所有只读工具  │           │
+├─────────────────────────┤           │
+│ 3. bash safety          │ ── 命中 ──┤───►  deny + 把拒绝原因写回 tool_result
+│   sudo / rm -rf / $()…  │           │       （仍然要塞 tool 消息，否则模型会报错）
+├─────────────────────────┤           │
+│ 4. allow rules          │ ── 命中 ──┐
+├─────────────────────────┤           │
+│ 5. ask user [y/N]       │ ─ y ──────┤───►  allow + 真正调用 executeTool
+└─────────────────────────┘ ─ n ──────┘
+```
+
+**三种权限模式：**
+
+| 模式 | 行为 | 适用场景 |
+|------|------|---------|
+| `default` | 未命中规则时弹 [y/N] 询问用户 | 日常交互（默认） |
+| `plan` | 所有写入/副作用类工具一律拒绝 | 计划、审查、分析 |
+| `auto` | 只读工具自动放行，写入工具仍要问 | 高流畅度的探索阶段 |
+
+**两类规则（`PermissionRule`）：**
+
+```js
+// deny 优先于 allow，命中即拒绝
+{ tool: 'execute_bash', content: 'sudo *',  behavior: 'deny' }
+{ tool: 'execute_bash', content: 'rm -rf *', behavior: 'deny' }
+{ tool: 'read_file',                         behavior: 'allow' }
+```
+
+`content` 是一个简单 glob，`*` 翻译成 `.*` 后整串匹配 `command` 或 `content` 字段。
+
+**Bash 为什么要单独一层？**
+`read_file` 顶多读错文件，`execute_bash` 可以做任何事。所以 s07 把 bash 当成"可执行动作描述"
+而不是普通文本，单独走一层最小安全检查（[`src/permissions/bash-safety.js`](src/permissions/bash-safety.js)）：
+拦截 `sudo`、`rm -rf`、命令替换 `` $() ``/反引号、向块设备写入、fork bomb 等明显危险。
+
+**斜杠命令（在 `👤 你 [mode]:` 提示符后输入）：**
+
+| 命令 | 说明 |
+|------|------|
+| `/mode default` | 切回默认模式（未命中规则时问用户） |
+| `/mode plan` | 切到只读模式（写入工具一律拒绝） |
+| `/mode auto` | 切到自动模式（只读工具自动放行） |
+| `/mode` | 不带参数：仅打印当前模式 |
+| `/perm` | 打印当前权限状态：模式、连续被拒次数、规则数量 |
+
+斜杠命令不会进入 `messages`，不会污染对话历史。
+
+**几个容易踩坑的点：**
+
+1. **被 deny 也要塞 tool_result。** 如果 `tool_call` 没有匹配的 `tool` 消息，下一轮请求会直接 400。
+   主循环里被拒时会推 `Permission denied: ...` 作为 tool result，让模型知道"我刚才的尝试被挡了"。
+2. **子 Agent 共享同一套权限管道。** 不会出现"父 Agent 被挡，子 Agent 偷偷绕过"的破窗。
+3. **连续被拒计数。** 累计 ≥3 次会在控制台打印提示，建议你切到 `plan` 模式或重新明确目标。
+4. **deny 一定先于 allow / mode。** 这样像 `sudo` 这种命令在任何模式下都不会被放过。
+
 ## 🚀 快速开始
 
 ### 1. 克隆项目
@@ -211,6 +292,20 @@ Use a task to create a new module, then verify it from here
 如果你觉得上下文已经很乱，请主动调用 compact 工具
 ```
 
+**权限系统测试（s07）：**
+```
+# 先把模式切到只读，再让模型尝试写文件，应当被 plan 模式拒绝
+/mode plan
+帮我创建一个 hello.txt，内容随便写
+
+# 切到 default，让模型执行一条危险命令，应当被 deny rule 拒绝
+/mode default
+帮我跑一下 sudo rm -rf /tmp/test
+
+# 查看当前权限状态
+/perm
+```
+
 ## ⚙️ 配置说明
 
 ### API 配置
@@ -240,9 +335,10 @@ Use a task to create a new module, then verify it from here
 - **s01** Agent 循环 — 理解 LLM 如何在循环中持续思考
 - **s02** 工具系统 — 给 Agent 装上"手和脚"
 - **s03** TodoWrite — 让 Agent 先计划再动手
-- **s04** 子 Agent — 任务委派与上下文隔离（✅ 当前阶段）
+- **s04** 子 Agent — 任务委派与上下文隔离
 - **s05** 技能系统 — 可复用的能力模块
 - **s06** 上下文压缩 — 解决上下文窗口溢出
+- **s07** 权限系统 — 在工具执行前过一道安全闸门（✅ 当前阶段）
 - ...
 
 ## 📝 License
