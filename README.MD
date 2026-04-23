@@ -20,6 +20,7 @@
 | s07 | 权限系统 | deny/mode/bash-safety/allow/ask 五段管道 + 三种模式 | ✅ 已完成 |
 | s08 | Hook 系统 | SessionStart / PreToolUse / PostToolUse + 统一 0/1/2 退出码 | ✅ 已完成 |
 | s09 | 记忆系统 | 4 类 × 2 作用域的跨会话存储 + save/list/delete 工具 + /memory 命令 | ✅ 已完成 |
+| s10 | 系统提示词 | SystemPromptBuilder 流水线（6 段拼装 + 稳定/动态边界）+ system-reminder 收敛 + /system 命令 | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
@@ -36,6 +37,8 @@ claude-code-node/
 │   │   └── index.js           #   HookRunner + register/runHooks，内置欢迎 + 审计示范
 │   ├── memory/                # s09: 记忆系统
 │   │   └── index.js           #   saveMemory / listMemories / deleteMemory + section 加载
+│   ├── system-prompt/         # s10: 系统提示词流水线
+│   │   └── index.js           #   SystemPromptBuilder（6 段拼装）+ buildSystemReminder 帮助函数
 │   ├── context/
 │   │   └── compact.js         # s06: 上下文压缩
 │   └── tools/
@@ -421,6 +424,84 @@ The user explicitly prefers tabs for indentation in source files.
 4. **子 Agent 不暴露 memory 工具。** 子 Agent 是短期任务、独立上下文的执行者，不应该有"跨会话留下东西"的语义——这正是为什么 3 个 memory 工具只放在 `parentTools` 里。
 5. **推荐具体路径/函数/外部 URL 前再核对一次。** memory 适合告诉你"去哪里验证"，不适合直接复述，因为命名、路径、入口都会变。
 
+### 系统提示词 (s10)
+
+到 s09 为止，system prompt 还是直接写在 [`src/index.js`](src/index.js) 里的一坨硬编码字符串：身份说明 + 工具说明 + 技能描述 + memory 段，全靠 `+` 拼起来。在最小 demo 里它当然能跑，但只要系统继续长功能，这种做法会迅速破产——工具列表会变、skills 会变、memory 会被 `/memory ignore` 切换、日期 / cwd / 权限模式每轮都可能变、还有些提醒只该活一轮不该永远塞进系统说明。
+
+**核心理念（一句话）：system prompt 不是一整块硬编码文本，而是一条按"稳定 → 动态"边界拼装出来的输入流水线。**
+
+```
+┌──────────────────────── 稳定段（适合后续做缓存）────────────────────────┐
+│  1. core         身份 + 多步任务规则 + memory 边界 + system-reminder 边界 │
+│  2. tools        当前可用工具的名字 + 一句话作用                          │
+│  3. skills       skillLoader.getDescriptions()（按需加载的第一层）         │
+│  4. memory       loadMemorySection()（ignore 时整段消失）                 │
+│  5. CLAUDE.md    ./CLAUDE.md 项目长期规则（缺失则跳过）                   │
+├──────────────────────── === DYNAMIC === 边界 ───────────────────────────┤
+│  6. dynamic      Date / Cwd / Model / Mode（每轮重新生成）                │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+边界标记 `=== DYNAMIC ===` 不是模型必须遵守的协议，只是给人和后续缓存层都能识别的一道接缝：上面相对稳定，下面每轮都可能变。
+
+**为什么不能继续用一坨大字符串？**
+
+| 问题 | 表现 |
+|------|------|
+| 不好维护 | 不知道哪一段来自哪里、改哪里安全 |
+| 不好测试 | 没法单独验证某一段（如 skills 描述）拼出来对不对 |
+| 不好缓存 | 稳定的工具说明和每轮变化的日期混在一起，整段都不能复用 |
+
+**两个关键边界（s10 最容易讲歪的地方）：**
+
+| 来源 | 该放哪里 | 例子 |
+|------|---------|------|
+| 长期身份/规则/工具 | system prompt | "你是编程助手"、"用 todo 管理多步任务" |
+| 跨会话事实 | system prompt 的 memory 段 | "用户偏爱 tab 缩进" |
+| 项目长期规则 | system prompt 的 CLAUDE.md 段 | "本仓库不允许引入新依赖" |
+| 本轮临时提醒 | **system reminder**（user 消息 + `<system-reminder>` 标签） | todo nag、PreToolUse hook 注入 |
+
+system reminder 仍然以 user 消息形式追加，但通过统一的 `<system-reminder>` 标签让模型清楚区分"真用户输入"和"系统硬塞内容"。s09 留下的 `<reminder>` / `<hook>` 字面量在 s10 全部收敛到 [`buildSystemReminder()`](src/system-prompt/index.js)，模型只需要识别一种格式。
+
+**SystemPromptBuilder 的最小用法：**
+
+```js
+import { SystemPromptBuilder } from './system-prompt/index.js';
+
+const promptBuilder = new SystemPromptBuilder({
+    skillLoader,           // s05 的 SkillLoader 实例
+    model: 'qwen3.5-flash',
+    getMode,               // s07 的权限模式读取器
+    loadMemorySection      // s09 的 memory 段加载器
+});
+
+messages[0] = { role: 'system', content: promptBuilder.build() };
+```
+
+依赖通过构造函数注入而不是顶部 import：让 system-prompt 模块本身保持纯净，便于测试，主循环也明确"持有"了所有来源。
+
+**新增斜杠命令：**
+
+| 命令 | 说明 |
+|------|------|
+| `/system` | 打印当前 system prompt 的完整组装结果（纯调试用，不入 messages） |
+
+任何时候你怀疑"模型为什么这样回答"，先用它确认流水线最终输出是什么。
+
+**与既有系统的协作：**
+
+- `/memory ignore|use` 切换后，主循环调用 `rebuildSystemPrompt()`（内部就是 `messages[0] = builder.build()`），下一轮就能反映出 memory 段的存在/消失。
+- `/mode` 切换也会触发 `rebuildSystemPrompt()`，因为动态段的 `Mode:` 字段需要更新。
+- skills 数量变化（虽然教学版启动后不动）只要重新 `build()` 就会自然反映。
+
+**几个容易踩坑的点：**
+
+1. **CLAUDE.md 缺失要降级成空段，而不是塞个"暂无规则"占位。** 否则模型会以为"项目特意声明了没规则"，反而干扰判断。
+2. **memory ignore 时整段消失，而不是塞一个空标题。** 同理，"看到一段空 memory" 会让模型误以为"用户故意清空了所有偏好"。
+3. **system-reminder 仍然是 user 消息，不是 system 消息。** OpenAI API 在对话进行中没有"系统补刀"的角色，唯一可靠的注入位置就是 user。标签的作用是让模型从内容上区分。
+4. **每次 build() 都重新拉值，不要做局部缓存。** 教学版故意不做缓存，避免"上一轮 mode 已切但 prompt 还是旧值"的隐性 bug；真要做缓存，请等到引入 token 预算 / section 注册表那一步统一处理。
+5. **不要在 core 段塞动态信息。** 日期 / cwd / mode 一旦混进 core，整个"稳定段 vs 动态段"的边界就废了——这正是这一章最想立住的纪律。
+
 ## 🚀 快速开始
 
 ### 1. 克隆项目
@@ -537,6 +618,23 @@ node src/index.js
 cat .memory/private/MEMORY.md
 ```
 
+**系统提示词测试（s10）：**
+```
+# 直接打印当前组装出来的 system prompt（看 6 段是怎么拼起来的）
+/system
+
+# 切换权限模式后再看一次：动态段的 Mode 字段应该跟着变
+/mode plan
+/system
+
+# 在项目根写一个 CLAUDE.md，再 /system 一次：会多出"项目长期规则"段
+echo "本项目所有提交信息必须使用中文。" > CLAUDE.md
+/system
+
+# 触发一次 todo nag（连续 3 轮不调 todo 工具），查看注入的提醒长什么样
+# 现在统一是 <system-reminder>...</system-reminder> 标签，不再是 <reminder>/<hook>
+```
+
 ## ⚙️ 配置说明
 
 ### API 配置
@@ -571,7 +669,8 @@ cat .memory/private/MEMORY.md
 - **s06** 上下文压缩 — 解决上下文窗口溢出
 - **s07** 权限系统 — 在工具执行前过一道安全闸门
 - **s08** Hook 系统 — 在固定时机扩展系统，而不是改写主循环
-- **s09** 记忆系统 — 跨会话保存"以后还会有用、当前代码看不出来"的信息（✅ 当前阶段）
+- **s09** 记忆系统 — 跨会话保存"以后还会有用、当前代码看不出来"的信息
+- **s10** 系统提示词 — 把 system prompt 升级成按段组装的输入流水线（✅ 当前阶段）
 - ...
 
 ## 📝 License

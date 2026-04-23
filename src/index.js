@@ -36,6 +36,11 @@ import {
     describeMemoryState,
     listMemories
 } from './memory/index.js';
+// 【s10 新增】系统提示词流水线
+//   SystemPromptBuilder —— 把 6 段输入按"稳定 → 动态"边界组装成最终 system prompt
+//   buildSystemReminder —— 把临时提醒统一包成 <system-reminder> 标签，
+//                           取代之前散落的 <reminder>/<hook> 字面量
+import { SystemPromptBuilder, buildSystemReminder } from './system-prompt/index.js';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -44,40 +49,32 @@ const openai = new OpenAI({
 const MODEL = 'qwen3.5-flash';
 
 async function main() {
-    // 【s09 重构】把 system prompt 拆成 baseSystemPrompt（不变） + memory section（可切换）
-    //   原因：用户随时可能输入 /memory ignore 让本会话不参考 memory，
-    //   这意味着 messages[0].content 必须能在运行时重组。
-    //   把"基底"和"动态部分"分开存储，rebuildSystemPrompt 直接拼回去即可。
-    const baseSystemPrompt = `你是一个专业的编程助手，可以使用工具来完成任务。
-Use the todo tool to plan multi-step tasks.
-Mark tasks as in_progress before starting, and completed when done.
-Only one task can be in_progress at a time.
-Prefer using tools over writing prose.
-Use the task tool to delegate subtasks that would benefit from a clean context.
-The task tool spawns a subagent that has its own fresh message history.
-Delegate work like reading multiple files, running commands, or any exploratory task.
-
-记忆系统 (s09):
-- 跨会话有用、且不能从代码直接重新看出来的信息，可以调用 save_memory 保存。
-- 当前任务进度、文件路径、函数签名等可重新观察的内容，不要写进 memory。
-- memory 里的信息可能已过时；如与当前观察冲突，优先相信当前观察。
-
-可用技能 (使用 load_skill 加载详细指令):
-${skillLoader.getDescriptions()}`;
-
-    // 【s09 新增】会话起手把 memory section 拼到 system prompt 末尾
-    //   loadMemorySection 在 ignore 状态下会返回空字符串
-    //   这样 ignore 切换只需要重新调用 composeSystemPrompt + 改写 messages[0]
-    const composeSystemPrompt = () => baseSystemPrompt + loadMemorySection();
+    // 【s10 重构】system prompt 不再是一坨硬编码字符串，而是一条按段组装的流水线。
+    //
+    // 设计要点：
+    //   - SystemPromptBuilder 内部把 system prompt 分成 6 段：
+    //       core / tools / skills / memory / CLAUDE.md / dynamic
+    //     稳定段在前，动态段在后，中间有一条 === DYNAMIC === 边界。
+    //   - 所有"会变"的来源（skills、memory、模式、日期、cwd）都通过依赖注入，
+    //     每次 build() 都拉最新值，不存在"上一轮缓存导致信息过时"的隐患。
+    //   - /memory ignore|use 切换时，重新调用 build() 改写 messages[0] 即可，
+    //     比之前手工拼接 baseSystemPrompt + loadMemorySection() 更可维护。
+    const promptBuilder = new SystemPromptBuilder({
+        skillLoader,
+        model: MODEL,
+        getMode,
+        loadMemorySection
+    });
 
     let messages = [
-        { role: 'system', content: composeSystemPrompt() }
+        { role: 'system', content: promptBuilder.build() }
     ];
 
-    // 【s09】给 /memory 命令用的小工具：原地刷新 system prompt
+    // 【s09 → s10】原地刷新 system prompt 的小工具。
+    //   /memory ignore|use、/mode 切换等场景都可以复用它，
     //   只动 messages[0]，其他历史保留；模型在下一轮就能感知变化。
     const rebuildSystemPrompt = () => {
-        messages[0] = { role: 'system', content: composeSystemPrompt() };
+        messages[0] = { role: 'system', content: promptBuilder.build() };
     };
 
     const compactState = createCompactState();
@@ -107,6 +104,9 @@ ${skillLoader.getDescriptions()}`;
                     if (!target) {
                         console.log(`当前模式: ${getMode()}（用法: /mode default|plan|auto）`);
                     } else if (setMode(target)) {
+                        // 【s10】模式切换会影响 system prompt 的动态段（Mode 字段），
+                        // 顺手重组 messages[0]，让模型下一轮就能看到最新模式。
+                        rebuildSystemPrompt();
                         console.log(`✅ 已切换到 ${target} 模式`);
                     } else {
                         console.log(`❌ 未知模式: ${target}（可选: default / plan / auto）`);
@@ -115,6 +115,15 @@ ${skillLoader.getDescriptions()}`;
                 }
                 if (cmd === '/perm') {
                     console.log(describeState());
+                    continue;
+                }
+                // 【s10 新增】/system —— 打印当前 system prompt 的完整组装结果。
+                //   纯调试用，不入 messages。任何时候你怀疑"模型为什么这样回答"，
+                //   先用它确认一下流水线最终输出是什么。
+                if (cmd === '/system') {
+                    console.log('────── system prompt ──────');
+                    console.log(promptBuilder.build());
+                    console.log('────── end ──────');
                     continue;
                 }
                 // 【s09 新增】/memory 命令族 —— 查看状态 / 列表 / 临时忽略
@@ -152,7 +161,7 @@ ${skillLoader.getDescriptions()}`;
                     }
                     continue;
                 }
-                console.log(`未知命令: ${cmd}（支持 /mode、/perm、/memory）`);
+                console.log(`未知命令: ${cmd}（支持 /mode、/perm、/memory、/system）`);
                 continue;
             }
 
@@ -234,11 +243,11 @@ ${skillLoader.getDescriptions()}`;
                                 console.log(`   🪝 ${toolResultText}`);
                             } else {
                                 if (pre.exit_code === 2 && pre.message) {
-                                    // 把 hook 的补充说明作为 user 消息插入，让模型看到
-                                    // 用 <hook> 标签包裹，区别于真正的用户输入
+                                    // 【s10 收敛】hook 注入的临时提示统一走 <system-reminder> 标签，
+                                    // 不再用早期 <hook> 字面量，模型只需要识别一种"系统硬塞内容"格式。
                                     messages.push({
                                         role: 'user',
-                                        content: `<hook>${pre.message}</hook>`
+                                        content: buildSystemReminder(`[PreToolUse hook] ${pre.message}`)
                                     });
                                     console.log(`   🪝 PreToolUse 注入提示: ${pre.message}`);
                                 }
@@ -292,11 +301,12 @@ ${skillLoader.getDescriptions()}`;
                     // 这制造了“问责压力”——你不更新计划，系统就追着你问
                     if (roundsSinceTodo >= 3) {
                         console.log('📢 提醒模型更新 todo...');
-                        // 向 messages 中插入一条 user 角色的提醒消息
-                        // 用 <reminder> 标签包裹，让模型知道这是系统提醒而不是用户说的话
+                        // 【s10 收敛】todo nag 也走统一的 <system-reminder> 标签。
+                        // 提醒仍然以 user 消息形式追加（OpenAI API 没有"system mid-conversation"角色），
+                        // 但通过标签让模型清楚区分"真用户输入"和"系统硬塞的提醒"。
                         messages.push({
                             role: 'user',
-                            content: '<reminder>Update your todos. Mark completed tasks and set the next task to in_progress.</reminder>'
+                            content: buildSystemReminder('Update your todos. Mark completed tasks and set the next task to in_progress.')
                         });
                     }
 
