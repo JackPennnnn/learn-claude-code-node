@@ -1,2 +1,4 @@
 2026-04-22T09:13:42.421Z | write_file | {"path":"hello.ts","content":"console.log(\"Hello, World!\");"} | out=25
 2026-04-22T09:14:07.806Z | write_file | {"path":"data/hello.ts","content":"console.log(\"hello wor123\");"} | out=25
+2026-04-23T09:10:16.481Z | save_memory | {"name":"code-indentation-tab","description":"所有代码示例使用 tab 缩进而非空格","type":"user","content":"用户偏好在所有代码示例中使用 tab 缩进，而不是空格。这是一个长期的编码风格偏好，适用于我生成/展示的所有编程相关内容的代码部分。","scope":"private"} | out=84
+2026-04-23T09:11:54.291Z | write_file | {"content":"def fibonacci(n):\n\t\"\"\"返回第 n 个斐波那契数（从 0 开始计数）\n\t\n\t参数:\n\t    n: 要获取的斐波那契数的索引 (n >= 0)\n\t    \n\t返回:\n\t    第 n 个斐波那契数\n\t    \n\t示例:\n\t    fibonacci(0) -> 0\n\t    fibonacci(1) -> | out=29

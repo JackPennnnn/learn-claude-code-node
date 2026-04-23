@@ -25,6 +25,17 @@ import { gatekeep, getMode, setMode, describeState } from './permissions/index.j
 //   主循环只暴露 3 个时机：SessionStart / PreToolUse / PostToolUse
 //   import 时会自动注册内置示范 handler（欢迎信息 + 审计日志）
 import { runHooks } from './hooks/index.js';
+// 【s09 新增】记忆系统入口
+//   loadMemorySection —— 把 .memory/ 下所有跨会话信息拼成 system prompt 末段
+//   setIgnoreMemory   —— 用户说"忽略 memory"时切换为空，按 memory 不存在工作
+//   describeMemoryState / listMemories —— /memory 斜杠命令用
+import {
+    loadMemorySection,
+    setIgnoreMemory,
+    isMemoryIgnored,
+    describeMemoryState,
+    listMemories
+} from './memory/index.js';
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -33,13 +44,11 @@ const openai = new OpenAI({
 const MODEL = 'qwen3.5-flash';
 
 async function main() {
-    // 【核心修改 1】messages 放在循环外，作为整个会话的历史记录
-    // 【s03 修改】系统提示中告诉模型使用 todo 工具来规划多步任务
-    // 【s04 修改】系统提示中增加 task 工具的使用说明
-    let messages = [
-        {
-            role: 'system',
-            content: `你是一个专业的编程助手，可以使用工具来完成任务。
+    // 【s09 重构】把 system prompt 拆成 baseSystemPrompt（不变） + memory section（可切换）
+    //   原因：用户随时可能输入 /memory ignore 让本会话不参考 memory，
+    //   这意味着 messages[0].content 必须能在运行时重组。
+    //   把"基底"和"动态部分"分开存储，rebuildSystemPrompt 直接拼回去即可。
+    const baseSystemPrompt = `你是一个专业的编程助手，可以使用工具来完成任务。
 Use the todo tool to plan multi-step tasks.
 Mark tasks as in_progress before starting, and completed when done.
 Only one task can be in_progress at a time.
@@ -48,10 +57,29 @@ Use the task tool to delegate subtasks that would benefit from a clean context.
 The task tool spawns a subagent that has its own fresh message history.
 Delegate work like reading multiple files, running commands, or any exploratory task.
 
+记忆系统 (s09):
+- 跨会话有用、且不能从代码直接重新看出来的信息，可以调用 save_memory 保存。
+- 当前任务进度、文件路径、函数签名等可重新观察的内容，不要写进 memory。
+- memory 里的信息可能已过时；如与当前观察冲突，优先相信当前观察。
+
 可用技能 (使用 load_skill 加载详细指令):
-${skillLoader.getDescriptions()}`
-        }
+${skillLoader.getDescriptions()}`;
+
+    // 【s09 新增】会话起手把 memory section 拼到 system prompt 末尾
+    //   loadMemorySection 在 ignore 状态下会返回空字符串
+    //   这样 ignore 切换只需要重新调用 composeSystemPrompt + 改写 messages[0]
+    const composeSystemPrompt = () => baseSystemPrompt + loadMemorySection();
+
+    let messages = [
+        { role: 'system', content: composeSystemPrompt() }
     ];
+
+    // 【s09】给 /memory 命令用的小工具：原地刷新 system prompt
+    //   只动 messages[0]，其他历史保留；模型在下一轮就能感知变化。
+    const rebuildSystemPrompt = () => {
+        messages[0] = { role: 'system', content: composeSystemPrompt() };
+    };
+
     const compactState = createCompactState();
 
     // 【s08 新增】会话起手就触发一次 SessionStart hook
@@ -89,7 +117,42 @@ ${skillLoader.getDescriptions()}`
                     console.log(describeState());
                     continue;
                 }
-                console.log(`未知命令: ${cmd}（支持 /mode、/perm）`);
+                // 【s09 新增】/memory 命令族 —— 查看状态 / 列表 / 临时忽略
+                //
+                // 设计原则：
+                //   - 命令本身不进 messages，避免污染对话历史
+                //   - ignore/use 切换后立即重组 system prompt，下一轮就生效
+                //   - 故意不提供 /memory save——save 是模型的工作，不是用户在终端里手敲的
+                if (cmd === '/memory') {
+                    const sub = rest[0];
+                    if (!sub) {
+                        console.log(await describeMemoryState());
+                    } else if (sub === 'list') {
+                        const items = await listMemories({ scope: rest[1] });
+                        if (items.length === 0) {
+                            console.log('(no memories)');
+                        } else {
+                            for (const m of items) {
+                                console.log(`  [${m.scope}/${m.type}] ${m.name}: ${m.description}`);
+                            }
+                        }
+                    } else if (sub === 'ignore') {
+                        setIgnoreMemory(true);
+                        rebuildSystemPrompt();
+                        console.log('🙈 已忽略 memory（本会话内）。下一轮 system prompt 将不再包含 memory section。');
+                    } else if (sub === 'use') {
+                        setIgnoreMemory(false);
+                        rebuildSystemPrompt();
+                        console.log(`🧠 已重新启用 memory（当前 ignore=${isMemoryIgnored() ? 'on' : 'off'}）。`);
+                    } else {
+                        console.log('用法: /memory          查看状态');
+                        console.log('      /memory list   列出所有 memory（可选 private|team）');
+                        console.log('      /memory ignore 本会话忽略 memory');
+                        console.log('      /memory use    重新启用 memory');
+                    }
+                    continue;
+                }
+                console.log(`未知命令: ${cmd}（支持 /mode、/perm、/memory）`);
                 continue;
             }
 

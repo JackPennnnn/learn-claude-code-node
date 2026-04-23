@@ -19,6 +19,7 @@
 | s06 | 上下文压缩 | Persisted Output + Micro Compact + Summary Compact | ✅ 已完成 |
 | s07 | 权限系统 | deny/mode/bash-safety/allow/ask 五段管道 + 三种模式 | ✅ 已完成 |
 | s08 | Hook 系统 | SessionStart / PreToolUse / PostToolUse + 统一 0/1/2 退出码 | ✅ 已完成 |
+| s09 | 记忆系统 | 4 类 × 2 作用域的跨会话存储 + save/list/delete 工具 + /memory 命令 | ✅ 已完成 |
 
 ## 🏗️ 项目结构
 
@@ -33,6 +34,8 @@ claude-code-node/
 │   │   └── bash-safety.js     #   bash 最小安全检查（sudo / rm -rf / 命令替换…）
 │   ├── hooks/                 # s08: Hook 系统
 │   │   └── index.js           #   HookRunner + register/runHooks，内置欢迎 + 审计示范
+│   ├── memory/                # s09: 记忆系统
+│   │   └── index.js           #   saveMemory / listMemories / deleteMemory + section 加载
 │   ├── context/
 │   │   └── compact.js         # s06: 上下文压缩
 │   └── tools/
@@ -44,6 +47,9 @@ claude-code-node/
 │       └── subagent.js        # s04: 子智能体（独立上下文执行子任务）
 ├── skills/                    # s05: 技能定义目录
 ├── data/                      # 工具写入文件的默认目录
+├── .memory/                   # s09: 记忆落盘目录（private/ 在 .gitignore 中）
+│   ├── private/               #   仅本机用户的偏好/反馈
+│   └── team/                  #   团队共享的项目背景/外部资源指针
 ├── .env                       # 环境变量（API Key，不上传到 GitHub）
 ├── .gitignore
 ├── package.json
@@ -319,6 +325,102 @@ register('PreToolUse', async ({ tool_name, input }) => {
 3. **hook 抛错不会带崩主循环。** runner 把异常 catch 住，按 `exit_code=0` 继续，并打 warning。
 4. **`PostToolUse` 默认是观察用。** 不要靠它修改 messages —— 想注入说明请用 `exit_code=2` 显式声明。
 
+### 记忆系统 (s09)
+
+到 s08 为止，单次会话已经很完整：会规划、会派子任务、会按需加载技能、会压缩上下文、会过权限闸门、会跑 hook。**但只要会话一关，所有东西都没了。**
+
+下一次新会话，Agent 又"像第一次合作"——记不住用户偏好、记不住被纠正过的错误、记不住团队故意定下的项目约定。s09 给项目加上的就是这条跨会话的长期通道。
+
+**核心理念（一句话）：只有跨会话仍然有价值，而且不能轻易从当前仓库状态重新推导出来的信息，才值得进入 memory。**
+
+```
+        会话 N 结束              会话 N+1 开始
+            │                        │
+            ▼                        ▼
+   save_memory(...)         loadMemorySection()
+            │                        │
+            ▼                        ▼
+   .memory/<scope>/<name>.md ──► 拼到 system prompt 末尾
+            │                        │
+            ▼                        ▼
+   重建该作用域下的           模型在第 1 轮就能看到
+   MEMORY.md 索引               所有跨会话信息
+```
+
+**4 类 memory（教学版固定）：**
+
+| 类型 | 用来存什么 | 例子 |
+|------|-----------|------|
+| `user` | 用户长期偏好 | 喜欢 tab 缩进 / 回答要简洁 |
+| `feedback` | 被验证过的纠正/经验 | "以后遇到 X 先做 Y" |
+| `project` | 不易从代码看出的项目背景 | 某目录暂时不动是因为合规要求 |
+| `reference` | 外部资源指针 | 看板、监控、文档 URL |
+
+**2 种作用域：**
+
+| 作用域 | 谁能看 | 是否提交到仓库 |
+|-------|-------|---------------|
+| `private`（默认） | 仅本机用户 | ❌ 已加入 `.gitignore` |
+| `team` | 团队共享 | ✅ 可以提交，跨成员同步 |
+
+判断法：`user` 几乎总是 `private`；`project` / `reference` 通常更偏向 `team`；`feedback` 默认 `private`，除非它明确升级为团队规则。
+
+**3 个工具（仅在 `parentTools` 中暴露，子 Agent 不能写 memory）：**
+
+| 工具 | 作用 |
+|------|------|
+| `save_memory(name, description, type, content, scope?)` | 保存一条 memory，同名覆盖 |
+| `list_memories(scope?)` | 列出已有 memory（不含正文，节省 token） |
+| `delete_memory(name, scope)` | 删除一条 memory（`scope` 必填，避免误删 team） |
+
+**斜杠命令：**
+
+| 命令 | 说明 |
+|------|------|
+| `/memory` | 打印当前状态（总数、按作用域/类型分布、ignore 是否开启） |
+| `/memory list [private|team]` | 列出所有 memory |
+| `/memory ignore` | 本会话忽略 memory（system prompt 中不再注入 memory section） |
+| `/memory use` | 重新启用 memory |
+
+`/memory` 不会进入 `messages`，不会污染对话历史。
+
+**单条 memory 文件的样子：**
+
+```markdown
+---
+name: prefer-tabs
+description: User prefers tabs over spaces
+type: user
+scope: private
+created_at: 2026-04-23T08:51:13.123Z
+---
+The user explicitly prefers tabs for indentation in source files.
+```
+
+每个作用域目录下还有一个 `MEMORY.md` 索引文件，每次 `save` / `delete` 后自动重建——不重复保存正文，只列出"这个作用域里有什么 memory"，方便用户在 IDE 里 `cat` 一下就一目了然。
+
+**与 s07 / s08 的关系：**
+
+- `save_memory` / `delete_memory` 归类为**写入工具**（属于 `WRITE_TOOLS`），所以 `plan` 模式下会被一律拒绝、`default` 模式下会询问、`auto` 模式下也要确认。
+- `list_memories` 归类为**只读工具**，自动放行。
+- `PostToolUse` 审计 hook 会顺手把每次 memory 操作写到 `data/hooks-audit.log`，无需额外配置。
+
+**memory 与 task / plan / 系统提示的边界（最容易讲歪的地方）：**
+
+| 信息特点 | 应该放哪里 |
+|---------|-----------|
+| 只对这次任务有用 | `task` / `plan`（s03 的 todo） |
+| 以后很多会话还会用 | `memory`（s09） |
+| 长期、系统级、近似规则 | system prompt / README |
+
+**几个容易踩坑的点：**
+
+1. **memory 不是"什么都记"。** 文件结构、函数签名、当前任务进度、PR 号、修 bug 的代码细节、任何密钥——都**不要**进 memory。代码和 git 才是这些信息的真理之源。
+2. **memory 会漂移。** 它记录的是"曾经成立过的事实"，不是永久真理。回答前先核对当前状态；冲突时优先相信你刚观察到的真实状态。
+3. **用户说"忽略 memory"时，按它不存在工作。** 不要嘴上说"先忽略"却继续偷偷参考。`/memory ignore` 会重组 `messages[0]`，下一轮模型看到的就是没有 memory 的 system prompt。
+4. **子 Agent 不暴露 memory 工具。** 子 Agent 是短期任务、独立上下文的执行者，不应该有"跨会话留下东西"的语义——这正是为什么 3 个 memory 工具只放在 `parentTools` 里。
+5. **推荐具体路径/函数/外部 URL 前再核对一次。** memory 适合告诉你"去哪里验证"，不适合直接复述，因为命名、路径、入口都会变。
+
 ## 🚀 快速开始
 
 ### 1. 克隆项目
@@ -409,6 +511,32 @@ node src/index.js
 cat data/hooks-audit.log
 ```
 
+**记忆系统测试（s09）：**
+```
+# 让模型保存一条偏好（会触发权限询问，因为 save_memory 属于写入工具）
+请记住：我以后所有代码示例都用 tab 缩进，不要用空格
+
+# 查看刚刚存了什么
+/memory list
+
+# 看一眼存储现状
+/memory
+
+# 重启进程后再问，模型应该能"记得"你的偏好
+exit
+node src/index.js
+请给我写一个最简单的 fibonacci 函数
+
+# 临时不参考 memory
+/memory ignore
+
+# 重新启用
+/memory use
+
+# 直接看磁盘上的索引文件（每次 save/delete 自动重建）
+cat .memory/private/MEMORY.md
+```
+
 ## ⚙️ 配置说明
 
 ### API 配置
@@ -442,7 +570,8 @@ cat data/hooks-audit.log
 - **s05** 技能系统 — 可复用的能力模块
 - **s06** 上下文压缩 — 解决上下文窗口溢出
 - **s07** 权限系统 — 在工具执行前过一道安全闸门
-- **s08** Hook 系统 — 在固定时机扩展系统，而不是改写主循环（✅ 当前阶段）
+- **s08** Hook 系统 — 在固定时机扩展系统，而不是改写主循环
+- **s09** 记忆系统 — 跨会话保存"以后还会有用、当前代码看不出来"的信息（✅ 当前阶段）
 - ...
 
 ## 📝 License

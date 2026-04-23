@@ -57,10 +57,13 @@ import { checkBashSafety } from './bash-safety.js';
 // ═══════════════════════════════════════════════════════════════════════
 
 // 只读类工具：调用它们最多消耗算力，不会改变系统外部状态
-const READ_ONLY_TOOLS = new Set(['read_file', 'load_skill', 'todo']);
+// 【s09】list_memories 只读，归入此类
+const READ_ONLY_TOOLS = new Set(['read_file', 'load_skill', 'todo', 'list_memories']);
 
 // 写入/外部副作用类工具：可能落盘、起进程、派发子任务
-const WRITE_TOOLS = new Set(['write_file', 'execute_bash', 'task']);
+// 【s09】save_memory / delete_memory 会修改 .memory/ 下的文件，归入写入类
+//        这样 plan 模式会自动拒绝，default 模式会询问，auto 模式仍要确认
+const WRITE_TOOLS = new Set(['write_file', 'execute_bash', 'task', 'save_memory', 'delete_memory']);
 
 // ═══════════════════════════════════════════════════════════════════════
 // 权限模式
@@ -101,7 +104,9 @@ const allowRules = [
     { tool: 'read_file', behavior: 'allow' },
     { tool: 'load_skill', behavior: 'allow' },
     { tool: 'todo', behavior: 'allow' },
-    { tool: 'compact', behavior: 'allow' }
+    { tool: 'compact', behavior: 'allow' },
+    // 【s09】list_memories 是纯读：列出已有 memory 不会改任何东西
+    { tool: 'list_memories', behavior: 'allow' }
 ];
 
 /**

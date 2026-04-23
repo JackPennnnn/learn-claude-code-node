@@ -1,2 +1,5 @@
 node_modules
 .env
+
+# 【s09】记忆系统：仅个人作用域不上传，team 作用域允许提交以便跨成员共享
+.memory/private/

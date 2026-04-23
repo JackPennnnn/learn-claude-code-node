@@ -4,6 +4,10 @@ import { todoManager } from './todo.js';
 // 【s05 新增】导入技能加载器
 import { SkillLoader } from './skill-loader.js';
 import { requestManualCompact } from '../context/compact.js';
+// 【s09 新增】记忆系统：跨会话保存 user/feedback/project/reference 长期信息
+//   - 故意只在 parentTools 暴露这些工具：子 Agent 是短期任务，不该写跨会话记忆
+//   - saveMemory / listMemories / deleteMemory 都是异步函数，路由层 await 即可
+import { saveMemory, listMemories, deleteMemory, MEMORY_TYPES, MEMORY_SCOPES } from '../memory/index.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -161,6 +165,73 @@ export const parentTools = [
             }
         }
     },
+    // 【s09 新增】记忆系统三件套 —— save / list / delete
+    //
+    // 为什么放在 parentTools 而不是 childTools？
+    //   子 Agent 是短期、独立上下文的执行者，没有"跨会话留下东西"的语义。
+    //   只有父 Agent 才是会话的"主人"，写 memory 是它的责任。
+    //
+    // 描述里反复强调"边界"是为了让模型自己学会拒绝写无关信息：
+    //   memory 不是临时草稿，更不是当前任务进度。
+    {
+        type: 'function',
+        function: {
+            name: 'save_memory',
+            description: `Save a long-term memory that should persist across sessions.
+ONLY use this when the information is BOTH:
+  (1) likely useful in future conversations, AND
+  (2) cannot be easily re-derived by reading the current codebase.
+
+DO NOT use for: file structure, function signatures, current task progress, branch names, bug-fix details, or anything observable from code.
+
+Choose type carefully:
+  - user:      user's long-term preferences (e.g. coding style, verbosity)
+  - feedback:  a correction the user made that should generalize
+  - project:   non-obvious project background / convention / compliance reason
+  - reference: pointer to an external resource (board, dashboard, docs URL)
+
+Default scope is 'private' (only this user). Use 'team' only when the info is meant for the whole team.`,
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Short identifier (lowercase, will be slugified)' },
+                    description: { type: 'string', description: 'One-line summary shown in the index' },
+                    type: { type: 'string', enum: [...MEMORY_TYPES], description: 'Memory category' },
+                    content: { type: 'string', description: 'Body text (markdown allowed)' },
+                    scope: { type: 'string', enum: [...MEMORY_SCOPES], description: 'private (default) or team' }
+                },
+                required: ['name', 'description', 'type', 'content']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'list_memories',
+            description: 'List saved memories. Use this when you suspect a relevant memory exists but is not in the current system prompt (e.g. after /memory ignore was toggled).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    scope: { type: 'string', enum: [...MEMORY_SCOPES], description: 'Limit to one scope; omit for all' }
+                }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'delete_memory',
+            description: 'Delete a memory by name. Use when a saved memory is wrong, outdated, or no longer relevant. scope is REQUIRED to avoid accidentally deleting a team memory with the same name as a private one.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Memory name to delete' },
+                    scope: { type: 'string', enum: [...MEMORY_SCOPES], description: 'Which scope to delete from' }
+                },
+                required: ['name', 'scope']
+            }
+        }
+    },
     // 【s04 新增】task 工具 —— 分派子任务
     {
         type: 'function',
@@ -218,6 +289,37 @@ export const executeTool = async (toolName, toolArgs) => {
         case 'compact':
             requestManualCompact();
             return '已请求执行上下文压缩。下一轮思考前会复用统一的 compact 逻辑生成连续性摘要。';
+
+        // 【s09 新增】记忆系统 —— 三个工具共用同一个 memory 模块
+        // 注意所有返回值都用 JSON.stringify 转字符串：
+        //   tool result 必须是字符串，模型才能稳定解析；
+        //   结构化对象必须先序列化再返回。
+        case 'save_memory': {
+            const result = await saveMemory({
+                name: toolArgs.name,
+                description: toolArgs.description,
+                type: toolArgs.type,
+                content: toolArgs.content,
+                scope: toolArgs.scope
+            });
+            return `已保存 memory: ${result.name} [${result.scope}] → ${result.path}`;
+        }
+
+        case 'list_memories': {
+            const items = await listMemories({ scope: toolArgs.scope });
+            if (items.length === 0) return '(no memories)';
+            // 给模型一份紧凑的列表，每行一条；模型如果需要正文再调 read_file 即可
+            return items
+                .map((m) => `- [${m.scope}/${m.type}] ${m.name}: ${m.description} (${m.path})`)
+                .join('\n');
+        }
+
+        case 'delete_memory': {
+            const result = await deleteMemory({ name: toolArgs.name, scope: toolArgs.scope });
+            return result.ok
+                ? `已删除 memory: ${result.name} [${result.scope}]`
+                : `未删除：${result.reason}`;
+        }
 
         // 【s04 新增】task 工具 —— 启动子智能体
         // 为什么用动态 import() 而不是顶部 import？
