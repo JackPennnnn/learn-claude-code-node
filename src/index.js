@@ -77,7 +77,8 @@ async function main() {
         messages[0] = { role: 'system', content: promptBuilder.build() };
     };
 
-    const compactState = createCompactState();
+    const compactState = createCompactState()
+
 
     // 【s08 新增】会话起手就触发一次 SessionStart hook
     // 内置 handler 会打印欢迎信息 + 当前权限模式
